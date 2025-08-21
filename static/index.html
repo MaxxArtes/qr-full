@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>QR Full (PWA + FastAPI)</title>
+  <link rel="manifest" href="/manifest.webmanifest"/>
+  <meta name="theme-color" content="#111827"/>
+  <link rel="stylesheet" href="/static/style.css"/>
+</head>
+<body>
+  <div class="container">
+    <h1>QR Full <span class="badge">PWA + FastAPI + Postgres</span></h1>
+    <p class="small">Instale como app (Chrome/Android). Scanner usa <code>BarcodeDetector</code>; fallback por upload usa a API para decodificar.</p>
+    <div class="card">
+      <h3>Scanner (câmera)</h3>
+      <video id="video" playsinline muted></video>
+      <div class="row">
+        <button id="start">Iniciar scanner</button>
+        <button id="stop" class="secondary" disabled>Parar</button>
+      </div>
+      <div class="row"><strong>Último QR:</strong> <span id="last">—</span></div>
+    </div>
+    <div class="card">
+      <h3>Upload de imagem (fallback)</h3>
+      <div class="row">
+        <input id="upload" type="file" accept="image/*" capture="environment"/>
+        <button id="sendFile">Enviar imagem</button>
+      </div>
+      <p class="small">A imagem é processada no servidor com OpenCV.</p>
+    </div>
+    <div class="card">
+      <h3>Logs</h3>
+      <pre id="output">Pronto…</pre>
+      <div class="row">
+        <a class="button" href="/download">Baixar CSV</a>
+      </div>
+    </div>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

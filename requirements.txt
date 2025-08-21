@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+opencv-python
+python-dateutil
+python-multipart
+sqlalchemy
+psycopg2-binary
