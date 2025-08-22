@@ -1,27 +1,27 @@
-const CACHE_NAME = "qr-full-pwa-v1";
+// cache básico do shell do app
+const CACHE = "qr-full-v1";
 const ASSETS = [
   "/",
-  "/static/index.html",
   "/static/style.css",
   "/static/app.js",
-  "/manifest.webmanifest",
-  "/static/icons/icon-192.png",
-  "/static/icons/icon-512.png"
+  "/manifest.webmanifest"
 ];
+
 self.addEventListener("install", (e) => {
-  e.waitUntil(caches.open(CACHE_NAME).then((c) => c.addAll(ASSETS)));
+  e.waitUntil(caches.open(CACHE).then(c => c.addAll(ASSETS)));
 });
+
 self.addEventListener("activate", (e) => {
   e.waitUntil(
-    caches.keys().then(keys => Promise.all(
-      keys.filter(k => k !== CACHE_NAME).map(k => caches.delete(k))
-    ))
+    caches.keys().then(keys => Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k))))
   );
 });
+
 self.addEventListener("fetch", (e) => {
   const url = new URL(e.request.url);
-  if (url.pathname.startsWith("/save_text") || url.pathname.startsWith("/scan") || url.pathname.startsWith("/list") || url.pathname.startsWith("/download")) {
-    return;
+  if (url.origin === location.origin) {
+    e.respondWith(
+      caches.match(e.request).then((res) => res || fetch(e.request))
+    );
   }
-  e.respondWith(caches.match(e.request).then(resp => resp || fetch(e.request)));
 });

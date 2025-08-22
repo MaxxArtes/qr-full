@@ -1,9 +1,9 @@
-# app.py
+# app.py  (API FastAPI + PWA + NFC-e: itens + CNPJ/loja/data)
 import os
 import re
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
-from typing import Optional, List
+from typing import Optional, List, Tuple, Dict, Any
 
 import requests
 from bs4 import BeautifulSoup
@@ -12,7 +12,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from dateutil.tz import tzlocal
 
 from sqlalchemy import (
     create_engine, text, Column, Integer, Text, DateTime, func, Numeric
@@ -22,7 +21,6 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 from qr_utils import decode_qr_bytes
 
 # ---------------- Config ----------------
-# Dev local: sqlite:///./dev.db
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./dev.db")
 
 engine_kwargs = {}
@@ -41,17 +39,43 @@ class Scan(Base):
     timestamp = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     source = Column(Text)
     data_raw = Column(Text, nullable=False)
+    # novos metadados NFC-e
+    cnpj = Column(Text)
+    store_name = Column(Text)
+    purchase_date = Column(DateTime(timezone=True))
 
 class ScanItem(Base):
     __tablename__ = "scan_items"
     id = Column(Integer, primary_key=True, autoincrement=True)
     scan_id = Column(Integer, nullable=False)
     name = Column(Text, nullable=False)
-    qty = Column(Numeric(14, 4))         # ex.: 1.0000
-    unit_price = Column(Numeric(14, 4))  # ex.: 9.9900
-    total_price = Column(Numeric(14, 2)) # ex.: 9.99
+    qty = Column(Numeric(14, 4))
+    unit_price = Column(Numeric(14, 4))
+    total_price = Column(Numeric(14, 2))
 
 Base.metadata.create_all(engine)
+
+# migração leve para adicionar colunas se faltarem (SQLite e Postgres)
+def ensure_scan_extra_columns():
+    with engine.begin() as conn:
+        dialect = engine.dialect.name
+        needed = {"cnpj": "TEXT", "store_name": "TEXT", "purchase_date": "TIMESTAMP"}
+        if dialect == "sqlite":
+            rows = conn.execute(text("PRAGMA table_info(scans)")).fetchall()
+            existing = {row[1] for row in rows}
+            for col, typ in needed.items():
+                if col not in existing:
+                    conn.execute(text(f"ALTER TABLE scans ADD COLUMN {col} {typ}"))
+        else:
+            rows = conn.execute(text("SELECT column_name FROM information_schema.columns WHERE table_name='scans'")).fetchall()
+            existing = {row[0] for row in rows}
+            for col, typ in needed.items():
+                if col not in existing:
+                    if col == "purchase_date":
+                        conn.execute(text("ALTER TABLE scans ADD COLUMN purchase_date TIMESTAMP WITH TIME ZONE"))
+                    else:
+                        conn.execute(text(f"ALTER TABLE scans ADD COLUMN {col} {typ}"))
+ensure_scan_extra_columns()
 
 # ---------------- App ----------------
 app = FastAPI(title="QR Full (FastAPI + PWA + NFC-e)")
@@ -65,77 +89,76 @@ app.add_middleware(
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-def now_iso() -> str:
-    return datetime.now(tzlocal()).isoformat()
-
 class QRText(BaseModel):
     text: str
     source: Optional[str] = "pwa"
 
-# ---------------- Util: parse moeda/quantidade ----------------
+# ---------------- Utils ----------------
 def parse_br_decimal(s: str) -> Optional[Decimal]:
-    """
-    Converte 'R$ 1.234,56' -> Decimal('1234.56').
-    Aceita '1,00', '2.345,7', etc. Retorna None se não conseguir.
-    """
     if s is None:
         return None
     s = s.strip()
-    s = re.sub(r'[^\d,.-]', '', s)  # remove R$, espaços, etc
+    s = re.sub(r'[^\d,.-]', '', s)
     if s.count(',') > 1 and s.count('.') == 0:
-        # algo muito estranho, deixa pra trás
         return None
-    # remove separador de milhar '.' e troca ',' por '.'
     s = s.replace('.', '').replace(',', '.')
     try:
         return Decimal(s)
     except (InvalidOperation, ValueError):
         return None
 
+def parse_br_datetime(s: str) -> Optional[datetime]:
+    if not s:
+        return None
+    s = s.strip()
+    for fmt in ("%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(s, fmt)
+        except Exception:
+            pass
+    return None
+
 def looks_like_nfce_url(text: str) -> bool:
-    """
-    Heurística simples: URLs de QR de NFC-e da SEFAZ
-    - geralmente têm 'sefaz' no host e param 'p=' com a chave
-    - /consultaNFCe ou /QRCode etc.
-    """
     return (
         ("http://" in text or "https://" in text)
         and ("sefaz" in text.lower() or "fazenda" in text.lower())
         and ("p=" in text or "chNFe" in text or "chave" in text.lower())
     )
 
-# ---------------- Scraper NFC-e ----------------
-def fetch_nfce_items(qr_url: str, timeout: float = 15.0) -> List[dict]:
-    """
-    Baixa a página pública do QR da NFC-e e extrai itens.
-    Retorna lista: [{name, qty, unit_price, total_price}, ...]
-    Observação: o HTML varia por estado e versão, então tentamos múltiplas estratégias.
-    """
+def _has_lxml() -> bool:
+    try:
+        import lxml  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+# ----------- Scraper NFC-e (meta + itens) -----------
+def _fetch_nfce_page(qr_url: str, timeout: float = 15.0):
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-                      " AppleWebKit/537.36 (KHTML, like Gecko)"
-                      " Chrome/124.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
         "Accept-Language": "pt-BR,pt;q=0.9",
     }
     try:
         r = requests.get(qr_url, headers=headers, timeout=timeout, allow_redirects=True)
     except Exception:
-        return []
+        return None, ""
     if r.status_code != 200:
-        return []
-    html = r.text
-    soup = BeautifulSoup(html, "lxml") if _has_lxml() else BeautifulSoup(html, "html.parser")
+        return None, ""
+    soup = BeautifulSoup(r.text, "lxml") if _has_lxml() else BeautifulSoup(r.text, "html.parser")
     text_all = " ".join(s.strip() for s in soup.stripped_strings)
+    return soup, text_all
 
-    # 1) Padrão comum: tabela com cabeçalhos "Descrição", "Qtde", "Valor unitário", "Valor total"
-    # Procurar primeira tabela que tenha esses headers
+def fetch_nfce_items(qr_url: str, timeout: float = 15.0) -> List[dict]:
+    soup, text_all = _fetch_nfce_page(qr_url, timeout=timeout)
+    if not soup:
+        return []
+    # 1) Tabela típica (Descrição / Qtde / Valor unitário / Valor total)
     tables = soup.find_all("table")
     wanted_headers = ["descrição", "descricao", "qtde", "valor unitário", "valor unitario", "valor total"]
     for table in tables:
         ths = [th.get_text(strip=True).lower() for th in table.find_all(["th", "td"], recursive=True)][:8]
         score = sum(1 for h in wanted_headers if any(h in th for th in ths))
         if score >= 3:
-            # tenta mapear colunas por header
             header_row = None
             for tr in table.find_all("tr"):
                 cols = [c.get_text(strip=True).lower() for c in tr.find_all(["th", "td"])]
@@ -161,26 +184,17 @@ def fetch_nfce_items(qr_url: str, timeout: float = 15.0) -> List[dict]:
                 tds = tr.find_all("td")
                 if not tds:
                     continue
-                # pular a linha de header se cair aqui
                 if [td.get_text(strip=True).lower() for td in tds] == header_cols:
                     continue
                 name = tds[idx_name].get_text(strip=True) if idx_name is not None and idx_name < len(tds) else None
                 qty = parse_br_decimal(tds[idx_qty].get_text(strip=True)) if idx_qty is not None and idx_qty < len(tds) else None
                 unit_price = parse_br_decimal(tds[idx_unit].get_text(strip=True)) if idx_unit is not None and idx_unit < len(tds) else None
                 total_price = parse_br_decimal(tds[idx_total].get_text(strip=True)) if idx_total is not None and idx_total < len(tds) else None
-                # aceita se tiver pelo menos nome + alguma info de preço
                 if name and (unit_price is not None or total_price is not None):
-                    items.append({
-                        "name": name,
-                        "qty": qty,
-                        "unit_price": unit_price,
-                        "total_price": total_price
-                    })
+                    items.append({"name": name, "qty": qty, "unit_price": unit_price, "total_price": total_price})
             if items:
                 return items
-
-    # 2) Fallback por REGEX no texto completo (bastante comum em vários portais consumer)
-    # Padrões típicos no consumer: "... 1 - NOME DO PRODUTO Qtde.: 1,0000 Valor unitário R$ 9,99 Valor total R$ 9,99 ..."
+    # 2) Fallback: regex no texto corrido
     regex = re.compile(
         r"(?:\d+\s*-\s*)?(?P<name>[^|]+?)\s+Qtde\.?:\s*(?P<qty>[\d\.,]+)\s+Valor\s+unit[áa]rio\s*R?\$?\s*(?P<unit>[\d\.,]+)\s+Valor\s+total\s*R?\$?\s*(?P<total>[\d\.,]+)",
         flags=re.IGNORECASE
@@ -192,24 +206,50 @@ def fetch_nfce_items(qr_url: str, timeout: float = 15.0) -> List[dict]:
         unit_price = parse_br_decimal(m.group("unit"))
         total_price = parse_br_decimal(m.group("total"))
         if name and (unit_price is not None or total_price is not None):
-            items.append({
-                "name": name,
-                "qty": qty,
-                "unit_price": unit_price,
-                "total_price": total_price
-            })
-    if items:
-        return items
+            items.append({"name": name, "qty": qty, "unit_price": unit_price, "total_price": total_price})
+    return items
 
-    # 3) Sem itens encontrados
-    return []
+def fetch_nfce_meta(qr_url: str, timeout: float = 15.0) -> Dict[str, Any]:
+    soup, text_all = _fetch_nfce_page(qr_url, timeout=timeout)
+    if not soup:
+        return {}
+    meta: Dict[str, Any] = {"cnpj": None, "store_name": None, "purchase_date": None}
 
-def _has_lxml() -> bool:
-    try:
-        import lxml  # noqa: F401
-        return True
-    except Exception:
-        return False
+    # CNPJ
+    m = re.search(r"\b\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}\b", text_all)
+    if m:
+        meta["cnpj"] = m.group(0)
+
+    # Loja / Razão Social / Emitente (heurística)
+    labels = ["Razão Social", "Razao Social", "Nome/Razão Social", "Nome / Razão Social", "Emitente", "Estabelecimento", "Nome"]
+    def find_label_value():
+        for lab in labels:
+            el = soup.find(lambda tag: tag.name in ["td","th","span","div","label","strong","b"] and lab.lower() in tag.get_text(" ", strip=True).lower())
+            if el:
+                sib = el.find_next(string=True)
+                if sib:
+                    sv = str(sib).strip()
+                    if len(sv) > 2 and not any(k in sv.lower() for k in ["cnpj", "cpf", "emissão", "emissao"]):
+                        return sv
+                nxt = el.find_next()
+                if nxt and nxt is not el:
+                    sv = nxt.get_text(" ", strip=True)
+                    if sv and len(sv) > 2:
+                        return sv
+        return None
+    store = find_label_value()
+    if store:
+        store = re.split(r"\s{2,}", store)[0]
+        meta["store_name"] = store
+
+    # Data de emissão
+    dm = re.search(r"(Emiss[aã]o|Data\s+de\s+Emiss[aã]o)\s*[:\-]?\s*(\d{2}/\d{2}/\d{4}(?:\s+\d{2}:\d{2}(?::\d{2})?)?)", text_all, flags=re.IGNORECASE)
+    if dm:
+        dt = parse_br_datetime(dm.group(2))
+        if dt:
+            meta["purchase_date"] = dt
+
+    return meta
 
 # ---------------- Rotas PWA ----------------
 @app.get("/", response_class=HTMLResponse)
@@ -235,10 +275,6 @@ def health():
         return {"ok": False, "error": str(e)}
 
 def _save_scan_and_nfce_items(raw_text: str, source: str) -> dict:
-    """
-    Cria o Scan e, se for NFC-e, extrai itens e salva ScanItem.
-    Retorna dict com info do scan e quantos itens salvos.
-    """
     session = SessionLocal()
     try:
         scan = Scan(source=source or "pwa", data_raw=raw_text)
@@ -247,6 +283,14 @@ def _save_scan_and_nfce_items(raw_text: str, source: str) -> dict:
 
         items_saved = 0
         if looks_like_nfce_url(raw_text):
+            meta = fetch_nfce_meta(raw_text)
+            if meta:
+                scan.cnpj = meta.get("cnpj")
+                scan.store_name = meta.get("store_name")
+                pd = meta.get("purchase_date")
+                if isinstance(pd, datetime):
+                    scan.purchase_date = pd
+
             items = fetch_nfce_items(raw_text)
             for it in items:
                 session.add(ScanItem(
@@ -260,7 +304,7 @@ def _save_scan_and_nfce_items(raw_text: str, source: str) -> dict:
 
         session.commit()
         return {"scan_id": scan.id, "items_saved": items_saved}
-    except Exception as e:
+    except Exception:
         session.rollback()
         raise
     finally:
@@ -268,17 +312,14 @@ def _save_scan_and_nfce_items(raw_text: str, source: str) -> dict:
 
 @app.post("/save_text")
 def save_text(payload: QRText):
-    """Salva texto; se for URL de NFC-e, busca itens e grava."""
     try:
         result = _save_scan_and_nfce_items(payload.text, payload.source or "pwa")
         return {"ok": True, **result}
     except Exception as e:
-        # não vazar exceção crua pro cliente em prod; aqui mantemos simples
         return {"ok": False, "error": str(e)}
 
 @app.post("/scan")
 async def scan_image(file: UploadFile = File(...), source: Optional[str] = Query(default="upload")):
-    """Recebe imagem, decodifica QRs e salva; se achar NFC-e, extrai itens."""
     if not file.content_type or "image" not in file.content_type:
         raise HTTPException(status_code=400, detail="Envie uma imagem (content-type image/*).")
     data = await file.read()
@@ -292,10 +333,51 @@ async def scan_image(file: UploadFile = File(...), source: Optional[str] = Query
         results.append({"text": t, **info})
     return {"found": len(texts), "items": results}
 
+@app.get("/scan/{scan_id}")
+def get_scan(scan_id: int):
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT id, timestamp, source, data_raw, cnpj, store_name, purchase_date FROM scans WHERE id = :sid"),
+            {"sid": scan_id}
+        ).mappings().first()
+        if not row:
+            raise HTTPException(status_code=404, detail="Scan não encontrado")
+        items = conn.execute(
+            text("SELECT id, name, qty, unit_price, total_price FROM scan_items WHERE scan_id = :sid ORDER BY id ASC"),
+            {"sid": scan_id}
+        ).mappings().all()
+
+    def ts_to_str(ts):
+        if ts is None:
+            return None
+        if isinstance(ts, str):
+            return ts
+        return ts.isoformat()
+
+    return {
+        "scan": {
+            "id": row["id"],
+            "timestamp": ts_to_str(row["timestamp"]),
+            "source": row["source"],
+            "data_raw": row["data_raw"],
+            "cnpj": row["cnpj"],
+            "store_name": row["store_name"],
+            "purchase_date": ts_to_str(row["purchase_date"]),
+        },
+        "items": [
+            {
+                "id": it["id"],
+                "name": it["name"],
+                "qty": str(it["qty"]) if it["qty"] is not None else None,
+                "unit_price": str(it["unit_price"]) if it["unit_price"] is not None else None,
+                "total_price": str(it["total_price"]) if it["total_price"] is not None else None,
+            } for it in items
+        ]
+    }
+
 @app.get("/list")
 def list_scans(limit: int = 100, q: Optional[str] = None):
-    """Lista últimos registros; filtro opcional com ?q=trecho."""
-    sql = "SELECT id, timestamp, source, data_raw FROM scans"
+    sql = "SELECT id, timestamp, source, data_raw, cnpj, store_name, purchase_date FROM scans"
     params = {}
     if q:
         sql += " WHERE data_raw LIKE :q"
@@ -306,26 +388,28 @@ def list_scans(limit: int = 100, q: Optional[str] = None):
     with engine.connect() as conn:
         rows = conn.execute(text(sql), params).mappings().all()
 
+    def ts_to_str(ts):
+        if ts is None:
+            return None
+        if isinstance(ts, str):
+            return ts
+        return ts.isoformat()
+
     items = []
     for r in rows:
-        ts = r["timestamp"]
-        if ts is None:
-            ts_str = None
-        elif isinstance(ts, str):
-            ts_str = ts
-        else:
-            ts_str = ts.isoformat()
         items.append({
             "id": r["id"],
-            "timestamp": ts_str,
+            "timestamp": ts_to_str(r["timestamp"]),
             "source": r["source"],
             "data_raw": r["data_raw"],
+            "cnpj": r["cnpj"],
+            "store_name": r["store_name"],
+            "purchase_date": ts_to_str(r["purchase_date"]),
         })
     return {"count": len(items), "items": items}
 
 @app.get("/items")
 def list_items(scan_id: Optional[int] = None, limit: int = 200):
-    """Lista itens extraídos. Use ?scan_id= para filtrar por um scan específico."""
     sql = "SELECT id, scan_id, name, qty, unit_price, total_price FROM scan_items"
     params = {}
     if scan_id:
@@ -338,7 +422,6 @@ def list_items(scan_id: Optional[int] = None, limit: int = 200):
         rows = conn.execute(text(sql), params).mappings().all()
 
     def d(v):
-        # Converte Decimal/None para str ou vazio
         if v is None:
             return None
         return str(v)
@@ -359,39 +442,37 @@ def list_items(scan_id: Optional[int] = None, limit: int = 200):
 
 @app.get("/download")
 def download_csv():
-    """Exporta SCANS em CSV."""
     def row_iter():
-        yield ("id;timestamp;source;data_raw\n").encode("utf-8")
+        yield ("id;timestamp;source;data_raw;cnpj;store_name;purchase_date\n").encode("utf-8")
         with engine.connect() as conn:
             result = conn.execution_options(stream_results=True).execute(
-                text("SELECT id, timestamp, source, data_raw FROM scans ORDER BY id ASC")
+                text("SELECT id, timestamp, source, data_raw, cnpj, store_name, purchase_date FROM scans ORDER BY id ASC")
             )
             for r in result:
-                ts = r.timestamp
-                if ts is None:
-                    ts_str = ""
-                elif isinstance(ts, str):
-                    ts_str = ts
-                else:
-                    ts_str = ts.isoformat()
-
+                def ts_to_str(ts):
+                    if ts is None:
+                        return ""
+                    if isinstance(ts, str):
+                        return ts
+                    return ts.isoformat()
                 line = [
                     str(r.id),
-                    ts_str,
+                    ts_to_str(r.timestamp),
                     (r.source or ""),
-                    (r.data_raw or "").replace("\n", " ").replace("\r", " ")
+                    (r.data_raw or "").replace("\n", " ").replace("\r", " "),
+                    (r.cnpj or ""),
+                    (r.store_name or "").replace("\n", " ").replace("\r", " "),
+                    ts_to_str(r.purchase_date),
                 ]
                 yield (";".join(line) + "\n").encode("utf-8")
-
     return StreamingResponse(
         row_iter(),
         media_type="text/csv",
-        headers={"Content-Disposition": 'attachment; filename="scans.csv' + '"'},
+        headers={"Content-Disposition": 'attachment; filename="scans.csv"'},
     )
 
 @app.get("/download_items")
 def download_items_csv():
-    """Exporta ITENS extraídos em CSV."""
     def row_iter():
         yield ("id;scan_id;name;qty;unit_price;total_price\n").encode("utf-8")
         with engine.connect() as conn:
@@ -412,7 +493,6 @@ def download_items_csv():
                     to_s(r.total_price),
                 ]
                 yield (";".join(line) + "\n").encode("utf-8")
-
     return StreamingResponse(
         row_iter(),
         media_type="text/csv",

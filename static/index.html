@@ -1,42 +1,69 @@
 <!doctype html>
 <html lang="pt-br">
 <head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>QR Full (PWA + FastAPI)</title>
-  <link rel="manifest" href="/manifest.webmanifest"/>
-  <meta name="theme-color" content="#111827"/>
-  <link rel="stylesheet" href="/static/style.css"/>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>QR Full (PWA)</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <meta name="theme-color" content="#0ea5e9">
+  <link rel="icon" href="/static/icons/icon-192.png">
+  <link rel="apple-touch-icon" href="/static/icons/icon-192.png">
+  <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
   <div class="container">
-    <h1>QR Full <span class="badge">PWA + FastAPI + Postgres</span></h1>
-    <p class="small">Instale como app (Chrome/Android). Scanner usa <code>BarcodeDetector</code>; fallback por upload usa a API para decodificar.</p>
-    <div class="card">
-      <h3>Scanner (câmera)</h3>
-      <video id="video" playsinline muted></video>
-      <div class="row">
-        <button id="start">Iniciar scanner</button>
-        <button id="stop" class="secondary" disabled>Parar</button>
+    <h1>QR Full</h1>
+    <p class="muted">Leia QR / NFC-e e salve itens no banco</p>
+
+    <div class="grid">
+      <div class="card">
+        <h3>Scanner (câmera)</h3>
+        <div id="cameraArea">
+          <video id="video" autoplay playsinline></video>
+          <div class="row">
+            <button id="startCam">Iniciar câmera</button>
+            <button id="stopCam" class="secondary">Parar</button>
+          </div>
+          <div id="camSupport" class="muted"></div>
+        </div>
+        <div class="row">
+          <input id="textInput" placeholder="Cole aqui o texto/URL do QR" />
+          <button id="saveText">Salvar texto</button>
+        </div>
+        <div class="row">
+          <input id="upload" type="file" accept="image/*" />
+          <button id="sendFile" class="secondary">Enviar imagem</button>
+        </div>
+        <div class="last">
+          <div class="label">Último texto</div>
+          <div id="lastText">—</div>
+        </div>
+        <div class="links">
+          <a href="/download" target="_blank">Baixar CSV (scans)</a>
+          <a href="/download_items" target="_blank">Baixar CSV (itens)</a>
+        </div>
       </div>
-      <div class="row"><strong>Último QR:</strong> <span id="last">—</span></div>
-    </div>
-    <div class="card">
-      <h3>Upload de imagem (fallback)</h3>
-      <div class="row">
-        <input id="upload" type="file" accept="image/*" capture="environment"/>
-        <button id="sendFile">Enviar imagem</button>
-      </div>
-      <p class="small">A imagem é processada no servidor com OpenCV.</p>
-    </div>
-    <div class="card">
-      <h3>Logs</h3>
-      <pre id="output">Pronto…</pre>
-      <div class="row">
-        <a class="button" href="/download">Baixar CSV</a>
+
+      <div class="card">
+        <h3>Detalhes da compra</h3>
+        <div id="storeInfo" class="kv">
+          <div class="label">Loja</div><div id="storeName">—</div>
+          <div class="label">CNPJ</div><div id="storeCNPJ">—</div>
+          <div class="label">Data</div><div id="storeDate">—</div>
+        </div>
+        <div class="caption">Produtos</div>
+        <div style="overflow:auto">
+          <table>
+            <thead>
+              <tr><th>Item</th><th>Qtd</th><th>Unitário</th><th>Total</th></tr>
+            </thead>
+            <tbody id="itemsBody"></tbody>
+          </table>
+        </div>
       </div>
     </div>
   </div>
+
   <script src="/static/app.js"></script>
 </body>
 </html>
