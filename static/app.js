@@ -46,9 +46,10 @@ async function renderScanDetails(scanId){
       const tr = document.createElement("tr");
       const td1 = document.createElement("td"); td1.textContent = it.name || "";
       const td2 = document.createElement("td"); td2.textContent = it.qty ?? "";
-      const td3 = document.createElement("td"); td3.textContent = it.unit_price ?? "";
-      const td4 = document.createElement("td"); td4.textContent = it.total_price ?? "";
-      tr.append(td1, td2, td3, td4);
+      const td3 = document.createElement("td"); td3.textContent = it.unit ?? "";     // nova coluna: Un
+      const td4 = document.createElement("td"); td4.textContent = it.unit_price ?? "";
+      const td5 = document.createElement("td"); td5.textContent = it.total_price ?? "";
+      tr.append(td1, td2, td3, td4, td5);
       els.itemsBody.appendChild(tr);
     });
     log("scan_details", {scanId, items: (data.items||[]).length});

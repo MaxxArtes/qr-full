@@ -1,9 +1,9 @@
-# app.py  (API FastAPI + PWA + NFC-e: itens + CNPJ/loja/data)
+# app.py  (API FastAPI + PWA + NFC-e: itens + CNPJ/loja/data + UN)
 import os
 import re
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
-from typing import Optional, List, Tuple, Dict, Any
+from typing import Optional, List, Dict, Any
 
 import requests
 from bs4 import BeautifulSoup
@@ -39,7 +39,7 @@ class Scan(Base):
     timestamp = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     source = Column(Text)
     data_raw = Column(Text, nullable=False)
-    # novos metadados NFC-e
+    # metadados NFC‑e
     cnpj = Column(Text)
     store_name = Column(Text)
     purchase_date = Column(DateTime(timezone=True))
@@ -50,12 +50,13 @@ class ScanItem(Base):
     scan_id = Column(Integer, nullable=False)
     name = Column(Text, nullable=False)
     qty = Column(Numeric(14, 4))
+    unit = Column(Text)  # <-- nova coluna: unidade de medida (ex.: UN, KG, LT)
     unit_price = Column(Numeric(14, 4))
     total_price = Column(Numeric(14, 2))
 
 Base.metadata.create_all(engine)
 
-# migração leve para adicionar colunas se faltarem (SQLite e Postgres)
+# migração leve: adiciona colunas extras se faltarem (SQLite e Postgres)
 def ensure_scan_extra_columns():
     with engine.begin() as conn:
         dialect = engine.dialect.name
@@ -77,8 +78,24 @@ def ensure_scan_extra_columns():
                         conn.execute(text(f"ALTER TABLE scans ADD COLUMN {col} {typ}"))
 ensure_scan_extra_columns()
 
+# migração leve para scan_items: adiciona coluna 'unit' se não existir
+def ensure_scan_items_extra_columns():
+    with engine.begin() as conn:
+        dialect = engine.dialect.name
+        if dialect == "sqlite":
+            rows = conn.execute(text("PRAGMA table_info(scan_items)")).fetchall()
+            existing = {row[1] for row in rows}
+            if "unit" not in existing:
+                conn.execute(text("ALTER TABLE scan_items ADD COLUMN unit TEXT"))
+        else:
+            rows = conn.execute(text("SELECT column_name FROM information_schema.columns WHERE table_name='scan_items'")).fetchall()
+            existing = {row[0] for row in rows}
+            if "unit" not in existing:
+                conn.execute(text("ALTER TABLE scan_items ADD COLUMN unit TEXT"))
+ensure_scan_items_extra_columns()
+
 # ---------------- App ----------------
-app = FastAPI(title="QR Full (FastAPI + PWA + NFC-e)")
+app = FastAPI(title="QR Full (FastAPI + PWA + NFC‑e)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -122,7 +139,7 @@ def looks_like_nfce_url(text: str) -> bool:
     return (
         ("http://" in text or "https://" in text)
         and ("sefaz" in text.lower() or "fazenda" in text.lower())
-        and ("p=" in text or "chNFe" in text or "chave" in text.lower())
+        and ("p=" in text or "chnfe" in text.lower() or "chave" in text.lower())
     )
 
 def _has_lxml() -> bool:
@@ -132,7 +149,7 @@ def _has_lxml() -> bool:
     except Exception:
         return False
 
-# ----------- Scraper NFC-e (meta + itens) -----------
+# ----------- Scraper NFC‑e (meta + itens) -----------
 def _fetch_nfce_page(qr_url: str, timeout: float = 15.0):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
@@ -149,16 +166,24 @@ def _fetch_nfce_page(qr_url: str, timeout: float = 15.0):
     return soup, text_all
 
 def fetch_nfce_items(qr_url: str, timeout: float = 15.0) -> List[dict]:
+    """
+    Baixa a página pública do QR da NFC-e e extrai itens.
+    Cobra:
+      - Tabelas com cabeçalhos (Descrição / Qtde / UN / Valor unitário / Valor total)
+      - Layout "consumer" sem tabela: "Qtde.: 1,19  UN: KG  Vl. Unit.: 6,99  Vl. Total 8,32"
+    """
     soup, text_all = _fetch_nfce_page(qr_url, timeout=timeout)
     if not soup:
         return []
-    # 1) Tabela típica (Descrição / Qtde / Valor unitário / Valor total)
+
+    # 1) TABELA (quando existir)
     tables = soup.find_all("table")
     wanted_headers = ["descrição", "descricao", "qtde", "valor unitário", "valor unitario", "valor total"]
     for table in tables:
         ths = [th.get_text(strip=True).lower() for th in table.find_all(["th", "td"], recursive=True)][:8]
         score = sum(1 for h in wanted_headers if any(h in th for th in ths))
         if score >= 3:
+            # localizar a linha de cabeçalho
             header_row = None
             for tr in table.find_all("tr"):
                 cols = [c.get_text(strip=True).lower() for c in tr.find_all(["th", "td"])]
@@ -167,46 +192,121 @@ def fetch_nfce_items(qr_url: str, timeout: float = 15.0) -> List[dict]:
                     break
             if not header_row:
                 continue
+
             header_cols = [c.get_text(strip=True).lower() for c in header_row.find_all(["th", "td"])]
+
             def find_idx(keys):
                 for i, c in enumerate(header_cols):
                     for k in keys:
                         if k in c:
                             return i
                 return None
+
             idx_name = find_idx(["descri", "produto", "mercadoria", "item"])
             idx_qty = find_idx(["qtde", "quant"])
-            idx_unit = find_idx(["valor unit", "vl unit", "unitário", "unitario"])
+            idx_unit_price = find_idx(["valor unit", "vl unit", "unitário", "unitario"])
             idx_total = find_idx(["valor total", "vl total", "total"])
+
+            # tentar coluna de UN (fica entre Qtde e Vl Unit na maioria dos portais)
+            idx_unit_measure = None
+            if idx_unit_price is not None:
+                for i in range((idx_qty or -1) + 1, idx_unit_price):
+                    if i < len(header_cols):
+                        col = header_cols[i]
+                        if any(x in col for x in ["un", "un.", "unid", "unidade", "kg", "l", "lt", "pc", "pç", "und"]) and "valor" not in col:
+                            idx_unit_measure = i
+                            break
+                if idx_unit_measure is None and (idx_unit_price - 1) > (idx_qty or -1):
+                    idx_unit_measure = idx_unit_price - 1
 
             items = []
             for tr in table.find_all("tr"):
                 tds = tr.find_all("td")
                 if not tds:
                     continue
+                # pular o cabeçalho
                 if [td.get_text(strip=True).lower() for td in tds] == header_cols:
                     continue
+
                 name = tds[idx_name].get_text(strip=True) if idx_name is not None and idx_name < len(tds) else None
                 qty = parse_br_decimal(tds[idx_qty].get_text(strip=True)) if idx_qty is not None and idx_qty < len(tds) else None
-                unit_price = parse_br_decimal(tds[idx_unit].get_text(strip=True)) if idx_unit is not None and idx_unit < len(tds) else None
+                unit_measure = tds[idx_unit_measure].get_text(strip=True) if idx_unit_measure is not None and idx_unit_measure < len(tds) else None
+                unit_price = parse_br_decimal(tds[idx_unit_price].get_text(strip=True)) if idx_unit_price is not None and idx_unit_price < len(tds) else None
                 total_price = parse_br_decimal(tds[idx_total].get_text(strip=True)) if idx_total is not None and idx_total < len(tds) else None
+
                 if name and (unit_price is not None or total_price is not None):
-                    items.append({"name": name, "qty": qty, "unit_price": unit_price, "total_price": total_price})
+                    items.append({
+                        "name": name,
+                        "qty": qty,
+                        "unit": unit_measure,
+                        "unit_price": unit_price,
+                        "total_price": total_price
+                    })
             if items:
                 return items
-    # 2) Fallback: regex no texto corrido
+
+    # 2) FALLBACK POR REGEX — FORMATO DO SEU PRINT ("Qtde.: ...  UN: ...  Vl. Unit.: ...  Vl. Total ...")
+    patterns = [
+        # a) já existente (sites que escrevem 'Valor unitário' por extenso)
+        re.compile(
+            r"(?:\d+\s*-\s*)?(?P<name>[^|]+?)\s+Qtde\.?:\s*(?P<qty>[\d\.,]+)\s*(?P<unit>[A-Za-z]{1,6})?\s+Valor\s+unit[áa]rio\s*R?\$?\s*(?P<unit_price>[\d\.,]+)\s+Valor\s+total\s*R?\$?\s*(?P<total>[\d\.,]+)",
+            flags=re.IGNORECASE
+        ),
+        # b) **novo** — exatamente como no layout da imagem (com "(Código: ...)" e "Vl. Unit." / "Vl. Total")
+        re.compile(
+            r"(?P<name>.+?)\s*\(C[oó]digo\s*:\s*\d+\s*\)\s*Qtde\.?\s*:\s*(?P<qty>[\d\.,]+)\s*UN\s*:\s*(?P<unit>[A-Za-z]{1,6})\s*Vl\.?\s*Unit\.?\s*:\s*(?P<unit_price>[\d\.,]+)\s*Vl\.?\s*Total\s*:?\s*(?P<total>[\d\.,]+)",
+            flags=re.IGNORECASE
+        ),
+        # c) variação sem "(Código: ...)" entre nome e Qtde.
+        re.compile(
+            r"(?P<name>.+?)\s+Qtde\.?\s*:\s*(?P<qty>[\d\.,]+)\s*UN\s*:\s*(?P<unit>[A-Za-z]{1,6})\s*Vl\.?\s*Unit\.?\s*:\s*(?P<unit_price>[\d\.,]+)\s*Vl\.?\s*Total\s*:?\s*(?P<total>[\d\.,]+)",
+            flags=re.IGNORECASE
+        ),
+    ]
+
+    items: List[dict] = []
+    for rgx in patterns:
+        for m in rgx.finditer(text_all):
+            name = m.group("name").strip()
+            qty = parse_br_decimal(m.group("qty"))
+            unit_measure = (m.group("unit") or "").strip().upper() or None
+            unit_price = parse_br_decimal(m.group("unit_price"))
+            total_price = parse_br_decimal(m.group("total"))
+            if name and (unit_price is not None or total_price is not None):
+                items.append({
+                    "name": name,
+                    "qty": qty,
+                    "unit": unit_measure,
+                    "unit_price": unit_price,
+                    "total_price": total_price
+                })
+        if items:
+            break
+
+    return items
+
+
+    # 2) Fallback: regex no texto corrido (tenta capturar unidade também)
+    # Formato comum: "Qtde.: 1,0000 UN Valor unitário R$ 9,90 Valor total R$ 9,90"
     regex = re.compile(
-        r"(?:\d+\s*-\s*)?(?P<name>[^|]+?)\s+Qtde\.?:\s*(?P<qty>[\d\.,]+)\s+Valor\s+unit[áa]rio\s*R?\$?\s*(?P<unit>[\d\.,]+)\s+Valor\s+total\s*R?\$?\s*(?P<total>[\d\.,]+)",
+        r"(?:\d+\s*-\s*)?(?P<name>[^|]+?)\s+Qtde\.?:\s*(?P<qty>[\d\.,]+)\s*(?P<unit_measure>[A-Za-z]{1,6})?\s+Valor\s+unit[áa]rio\s*R?\$?\s*(?P<unit_price>[\d\.,]+)\s+Valor\s+total\s*R?\$?\s*(?P<total>[\d\.,]+)",
         flags=re.IGNORECASE
     )
     items = []
     for m in regex.finditer(text_all):
         name = m.group("name").strip()
         qty = parse_br_decimal(m.group("qty"))
-        unit_price = parse_br_decimal(m.group("unit"))
+        unit_measure = m.group("unit_measure")
+        unit_price = parse_br_decimal(m.group("unit_price"))
         total_price = parse_br_decimal(m.group("total"))
         if name and (unit_price is not None or total_price is not None):
-            items.append({"name": name, "qty": qty, "unit_price": unit_price, "total_price": total_price})
+            items.append({
+                "name": name,
+                "qty": qty,
+                "unit": unit_measure,
+                "unit_price": unit_price,
+                "total_price": total_price
+            })
     return items
 
 def fetch_nfce_meta(qr_url: str, timeout: float = 15.0) -> Dict[str, Any]:
@@ -220,7 +320,7 @@ def fetch_nfce_meta(qr_url: str, timeout: float = 15.0) -> Dict[str, Any]:
     if m:
         meta["cnpj"] = m.group(0)
 
-    # Loja / Razão Social / Emitente (heurística)
+    # Loja / razão social / emitente
     labels = ["Razão Social", "Razao Social", "Nome/Razão Social", "Nome / Razão Social", "Emitente", "Estabelecimento", "Nome"]
     def find_label_value():
         for lab in labels:
@@ -297,6 +397,7 @@ def _save_scan_and_nfce_items(raw_text: str, source: str) -> dict:
                     scan_id=scan.id,
                     name=it.get("name") or "",
                     qty=it.get("qty"),
+                    unit=it.get("unit"),           # salva unidade
                     unit_price=it.get("unit_price"),
                     total_price=it.get("total_price"),
                 ))
@@ -343,7 +444,7 @@ def get_scan(scan_id: int):
         if not row:
             raise HTTPException(status_code=404, detail="Scan não encontrado")
         items = conn.execute(
-            text("SELECT id, name, qty, unit_price, total_price FROM scan_items WHERE scan_id = :sid ORDER BY id ASC"),
+            text("SELECT id, name, qty, unit, unit_price, total_price FROM scan_items WHERE scan_id = :sid ORDER BY id ASC"),
             {"sid": scan_id}
         ).mappings().all()
 
@@ -369,6 +470,7 @@ def get_scan(scan_id: int):
                 "id": it["id"],
                 "name": it["name"],
                 "qty": str(it["qty"]) if it["qty"] is not None else None,
+                "unit": it["unit"],
                 "unit_price": str(it["unit_price"]) if it["unit_price"] is not None else None,
                 "total_price": str(it["total_price"]) if it["total_price"] is not None else None,
             } for it in items
@@ -410,7 +512,7 @@ def list_scans(limit: int = 100, q: Optional[str] = None):
 
 @app.get("/items")
 def list_items(scan_id: Optional[int] = None, limit: int = 200):
-    sql = "SELECT id, scan_id, name, qty, unit_price, total_price FROM scan_items"
+    sql = "SELECT id, scan_id, name, qty, unit, unit_price, total_price FROM scan_items"
     params = {}
     if scan_id:
         sql += " WHERE scan_id = :sid"
@@ -434,6 +536,7 @@ def list_items(scan_id: Optional[int] = None, limit: int = 200):
                 "scan_id": r["scan_id"],
                 "name": r["name"],
                 "qty": d(r["qty"]),
+                "unit": r["unit"],
                 "unit_price": d(r["unit_price"]),
                 "total_price": d(r["total_price"]),
             } for r in rows
@@ -474,10 +577,10 @@ def download_csv():
 @app.get("/download_items")
 def download_items_csv():
     def row_iter():
-        yield ("id;scan_id;name;qty;unit_price;total_price\n").encode("utf-8")
+        yield ("id;scan_id;name;qty;unit;unit_price;total_price\n").encode("utf-8")
         with engine.connect() as conn:
             result = conn.execution_options(stream_results=True).execute(
-                text("SELECT id, scan_id, name, qty, unit_price, total_price FROM scan_items ORDER BY id ASC")
+                text("SELECT id, scan_id, name, qty, unit, unit_price, total_price FROM scan_items ORDER BY id ASC")
             )
             for r in result:
                 def to_s(v):
@@ -489,6 +592,7 @@ def download_items_csv():
                     str(r.scan_id),
                     to_s(r.name),
                     to_s(r.qty),
+                    to_s(r.unit),
                     to_s(r.unit_price),
                     to_s(r.total_price),
                 ]
